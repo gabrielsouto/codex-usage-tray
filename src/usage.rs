@@ -5,6 +5,11 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+use std::env;
+#[cfg(windows)]
+use std::path::{Path, PathBuf};
+
 use crate::config::Config;
 
 #[derive(Debug, Clone)]
@@ -130,22 +135,7 @@ fn spawn_app_server(cfg: &Config) -> Result<Child, String> {
     }
 
     #[cfg(windows)]
-    let mut cmd = {
-        // npm installs Codex as codex.cmd on Windows, which needs cmd.exe for
-        // PATHEXT resolution. The v0.1.0 launcher used /S plus an extra pair
-        // of quotes around even a simple `codex`, which can change cmd.exe's
-        // quote-stripping rules and prevent the shim from being invoked.
-        let invocation = if command.starts_with('"') {
-            format!("{command} app-server --stdio")
-        } else if command.chars().any(char::is_whitespace) {
-            format!("\"{command}\" app-server --stdio")
-        } else {
-            format!("{command} app-server --stdio")
-        };
-        let mut c = Command::new("cmd");
-        c.args(["/D", "/C"]).arg(invocation);
-        c
-    };
+    let mut cmd = windows_codex_command(command)?;
 
     #[cfg(not(windows))]
     let mut cmd = {
@@ -160,9 +150,145 @@ fn spawn_app_server(cfg: &Config) -> Result<Child, String> {
         .spawn()
         .map_err(|e| {
             format!(
-                "failed to start `{command} app-server --stdio`: {e}. Is Codex installed and on PATH?"
+                "failed to start `{command} app-server --stdio`: {e}. Is Codex installed and accessible?"
             )
         })
+}
+
+#[cfg(windows)]
+fn windows_codex_command(requested: &str) -> Result<Command, String> {
+    let resolved = resolve_windows_codex(requested);
+    let lower = resolved.to_string_lossy().to_ascii_lowercase();
+
+    if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+        // cmd.exe needs the outer quote pair when the script path itself is
+        // quoted. This form works for npm/bun shims even when the path has
+        // spaces: cmd /D /S /C ""C:\path\codex.cmd" app-server --stdio"
+        let invocation = format!(
+            "\"\"{}\" app-server --stdio\"",
+            resolved.to_string_lossy()
+        );
+        let mut c = Command::new("cmd.exe");
+        c.args(["/D", "/S", "/C"]).arg(invocation);
+        return Ok(c);
+    }
+
+    if resolved.is_file() || lower.ends_with(".exe") {
+        let mut c = Command::new(&resolved);
+        c.args(["app-server", "--stdio"]);
+        return Ok(c);
+    }
+
+    // Final compatibility fallback for custom commands/aliases. `cmd.exe`
+    // handles PATHEXT resolution for commands such as an npm `codex.cmd` that
+    // is actually present in the inherited PATH.
+    let raw = resolved.to_string_lossy();
+    let invocation = if raw.chars().any(char::is_whitespace) {
+        format!("\"{raw}\" app-server --stdio")
+    } else {
+        format!("{raw} app-server --stdio")
+    };
+    let mut c = Command::new("cmd.exe");
+    c.args(["/D", "/C"]).arg(invocation);
+    Ok(c)
+}
+
+#[cfg(windows)]
+fn resolve_windows_codex(requested: &str) -> PathBuf {
+    let clean = requested.trim().trim_matches('"');
+
+    // An explicit path in config always wins.
+    let explicit = PathBuf::from(clean);
+    if clean != "codex" && explicit.is_file() {
+        return explicit;
+    }
+
+    // First respect the PATH inherited by this GUI process.
+    if clean.eq_ignore_ascii_case("codex") {
+        if let Some(path) = find_windows_command_on_path("codex") {
+            return path;
+        }
+
+        // Official standalone installer (current documented Windows install).
+        if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+            let path = PathBuf::from(local_app_data)
+                .join("Programs")
+                .join("OpenAI")
+                .join("Codex")
+                .join("bin")
+                .join("codex.exe");
+            if path.is_file() {
+                return path;
+            }
+        }
+
+        // The standalone install keeps a stable `current` junction under
+        // CODEX_HOME (or ~/.codex by default). Try both current layouts.
+        let codex_home = env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".codex")));
+        if let Some(home) = codex_home {
+            for relative in [
+                Path::new("packages").join("standalone").join("current").join("bin").join("codex.exe"),
+                Path::new("packages").join("standalone").join("current").join("codex.exe"),
+            ] {
+                let path = home.join(relative);
+                if path.is_file() {
+                    return path;
+                }
+            }
+        }
+
+        // npm global binaries on Windows normally live here.
+        if let Some(app_data) = env::var_os("APPDATA") {
+            let path = PathBuf::from(app_data).join("npm").join("codex.cmd");
+            if path.is_file() {
+                return path;
+            }
+        }
+
+        // bun global installs are another supported package-manager route.
+        if let Some(user_profile) = env::var_os("USERPROFILE") {
+            let bin = PathBuf::from(user_profile).join(".bun").join("bin");
+            for name in ["codex.exe", "codex.cmd"] {
+                let path = bin.join(name);
+                if path.is_file() {
+                    return path;
+                }
+            }
+        }
+    }
+
+    PathBuf::from(clean)
+}
+
+#[cfg(windows)]
+fn find_windows_command_on_path(name: &str) -> Option<PathBuf> {
+    let path_value = env::var_os("PATH")?;
+    let pathext = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    let extensions = pathext
+        .split(';')
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| ext.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    for dir in env::split_paths(&path_value) {
+        let plain = dir.join(name);
+        if plain.is_file() {
+            return Some(plain);
+        }
+        for ext in &extensions {
+            let candidate = dir.join(format!("{name}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            let candidate_upper = dir.join(format!("{name}{}", ext.to_ascii_uppercase()));
+            if candidate_upper.is_file() {
+                return Some(candidate_upper);
+            }
+        }
+    }
+    None
 }
 
 fn write_json_line(stdin: &mut ChildStdin, value: &Value) -> Result<(), String> {

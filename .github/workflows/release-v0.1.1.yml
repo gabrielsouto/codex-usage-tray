@@ -1,0 +1,45 @@
+name: Release v0.1.1
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-v0.1.1.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Build release executable
+        run: cargo build --release
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          @"
+          Corrige a inicialização do Codex app-server no Windows e melhora o diagnóstico de falhas.
+
+          - Corrige a montagem do comando `cmd.exe` usado para iniciar o Codex no Windows
+          - Remove o uso problemático de `/S` e das aspas extras ao executar `codex`
+          - Captura e exibe o stderr real do Codex quando a inicialização falha
+          - Diferencia timeout real de encerramento prematuro do app-server
+          - Mantém o protocolo documentado `initialize` → `initialized` → `account/rateLimits/read`
+          "@ | Set-Content -Encoding UTF8 release-notes.md
+
+          gh release create v0.1.1 `
+            "target/release/codex-usage-tray.exe#codex-usage-tray.exe" `
+            --target $env:GITHUB_SHA `
+            --title "v0.1.1" `
+            --notes-file release-notes.md

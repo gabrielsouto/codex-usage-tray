@@ -55,7 +55,7 @@ impl AppState {
                         .cfg
                         .notify_thresholds
                         .iter()
-                        .any(|&&t| prev < t as f64 && now_u >= t as f64)
+                        .any(|&t| prev < t as f64 && now_u >= t as f64)
                     {
                         notifications.push((
                             tr(lang, "notif_title").to_string(),

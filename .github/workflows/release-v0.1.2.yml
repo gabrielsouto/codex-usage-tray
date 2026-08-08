@@ -1,0 +1,48 @@
+name: Release v0.1.2
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-v0.1.2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Build release executable
+        run: cargo build --release
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          @"
+          Correção de descoberta do Codex no Windows.
+
+          - Procura primeiro no PATH herdado pelo aplicativo
+          - Detecta a instalação oficial em %LOCALAPPDATA%\Programs\OpenAI\Codex\bin
+          - Detecta instalações standalone em CODEX_HOME / %USERPROFILE%\.codex
+          - Detecta instalação global via npm em %APPDATA%\npm\codex.cmd
+          - Detecta instalação via bun
+          - Executa codex.exe diretamente quando possível
+          - Usa cmd.exe apenas para shims .cmd/.bat
+          - Mantém codex_command como override explícito
+          "@ | Set-Content -Encoding UTF8 release-notes.md
+
+          gh release create v0.1.2 `
+            "target/release/codex-usage-tray.exe#codex-usage-tray.exe" `
+            --target $env:GITHUB_SHA `
+            --title "v0.1.2" `
+            --notes-file release-notes.md

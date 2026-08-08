@@ -1,0 +1,47 @@
+name: Release v0.1.0
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release-v0.1.0.yml
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Build release executable
+        run: cargo build --release
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          @"
+          Primeira release pública do codex-usage-tray.
+
+          - Ícone na bandeja do Windows com uso das janelas do Codex
+          - Integração via `codex app-server` e `account/rateLimits/read`
+          - Identificação dinâmica das janelas por duração
+          - Horário e tempo restante até o reset
+          - Créditos e reset credits quando disponíveis
+          - Notificações configuráveis de uso e reset
+          - Português e inglês
+          "@ | Set-Content -Encoding UTF8 release-notes.md
+
+          gh release create v0.1.0 `
+            "target/release/codex-usage-tray.exe#codex-usage-tray.exe" `
+            --target $env:GITHUB_SHA `
+            --title "v0.1.0" `
+            --notes-file release-notes.md

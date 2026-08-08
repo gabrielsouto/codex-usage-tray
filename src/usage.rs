@@ -1,8 +1,8 @@
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
@@ -52,6 +52,7 @@ pub fn fetch(cfg: &Config) -> Result<Snapshot, String> {
     let mut child = spawn_app_server(cfg)?;
     let mut stdin = child.stdin.take().ok_or("could not open codex stdin")?;
     let stdout = child.stdout.take().ok_or("could not open codex stdout")?;
+    let stderr = child.stderr.take().ok_or("could not open codex stderr")?;
 
     let (tx, rx) = mpsc::channel::<Result<String, String>>();
     std::thread::spawn(move || {
@@ -68,6 +69,15 @@ pub fn fetch(cfg: &Config) -> Result<Snapshot, String> {
                 }
             }
         }
+    });
+
+    // Always drain stderr so a noisy subprocess cannot block on a full pipe.
+    // Keeping it also lets us expose the actual Codex/cmd error instead of
+    // misreporting every early process exit as a timeout.
+    let stderr_handle = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut text);
+        text
     });
 
     let timeout = Duration::from_secs(cfg.request_timeout_secs.max(5));
@@ -103,7 +113,14 @@ pub fn fetch(cfg: &Config) -> Result<Snapshot, String> {
 
     let _ = child.kill();
     let _ = child.wait();
-    result
+    let stderr_text = stderr_handle.join().unwrap_or_default();
+
+    match result {
+        Err(e) if !stderr_text.trim().is_empty() => {
+            Err(format!("{e}: {}", compact_stderr(&stderr_text)))
+        }
+        other => other,
+    }
 }
 
 fn spawn_app_server(cfg: &Config) -> Result<Child, String> {
@@ -114,10 +131,19 @@ fn spawn_app_server(cfg: &Config) -> Result<Child, String> {
 
     #[cfg(windows)]
     let mut cmd = {
-        let escaped = command.replace('"', "\"");
+        // npm installs Codex as codex.cmd on Windows, which needs cmd.exe for
+        // PATHEXT resolution. The v0.1.0 launcher used /S plus an extra pair
+        // of quotes around even a simple `codex`, which can change cmd.exe's
+        // quote-stripping rules and prevent the shim from being invoked.
+        let invocation = if command.starts_with('"') {
+            format!("{command} app-server --stdio")
+        } else if command.chars().any(char::is_whitespace) {
+            format!("\"{command}\" app-server --stdio")
+        } else {
+            format!("{command} app-server --stdio")
+        };
         let mut c = Command::new("cmd");
-        c.args(["/D", "/S", "/C"])
-            .arg(format!("\"{escaped}\" app-server --stdio"));
+        c.args(["/D", "/C"]).arg(invocation);
         c
     };
 
@@ -130,7 +156,7 @@ fn spawn_app_server(cfg: &Config) -> Result<Child, String> {
 
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
             format!(
@@ -159,9 +185,19 @@ fn wait_for_id(
             return Err(format!("codex app-server timed out waiting for response id {wanted_id}"));
         }
         let remaining = deadline.saturating_duration_since(now);
-        let line = rx
-            .recv_timeout(remaining)
-            .map_err(|_| format!("codex app-server timed out waiting for response id {wanted_id}"))??;
+        let line = match rx.recv_timeout(remaining) {
+            Ok(line) => line?,
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(format!(
+                    "codex app-server timed out waiting for response id {wanted_id}"
+                ));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(format!(
+                    "codex app-server closed stdout before response id {wanted_id}"
+                ));
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -183,6 +219,21 @@ fn wait_for_id(
             .get("result")
             .cloned()
             .ok_or_else(|| format!("codex app-server response {wanted_id} had no result"));
+    }
+}
+
+fn compact_stderr(text: &str) -> String {
+    let joined = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if joined.chars().count() <= 500 {
+        joined
+    } else {
+        let cut: String = joined.chars().take(499).collect();
+        format!("{cut}…")
     }
 }
 
@@ -275,5 +326,10 @@ mod tests {
         let v = json!({ "rateLimits": { "limitId": "codex", "primary": { "usedPercent": 22, "windowDurationMins": 10080 }, "secondary": null } });
         let s = snapshot_from_result(&v).unwrap();
         assert_eq!(s.focus_window().unwrap().duration_minutes, Some(10080));
+    }
+
+    #[test]
+    fn compact_stderr_flattens_lines() {
+        assert_eq!(compact_stderr("first\r\nsecond\n"), "first | second");
     }
 }

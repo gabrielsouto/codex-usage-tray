@@ -1,0 +1,28 @@
+[package]
+name = "codex-usage-tray"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Windows tray app that shows Codex usage limits and reset times"
+license = "MIT"
+repository = "https://github.com/gabrielsouto/codex-usage-tray"
+keywords = ["codex", "openai", "tray", "usage", "windows"]
+categories = ["gui"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "5"
+open = "5"
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.24", default-features = false }
+tao = "0.34"
+tauri-winrt-notification = "0.7"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

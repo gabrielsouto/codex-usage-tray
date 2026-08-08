@@ -8,9 +8,14 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use std::env;
 #[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Clone)]
 pub struct WindowUsage {
@@ -156,6 +161,14 @@ fn spawn_app_server(cfg: &Config) -> Result<Child, String> {
 }
 
 #[cfg(windows)]
+fn hide_console_window(command: &mut Command) {
+    // GUI tray applications should never flash a console window during the
+    // periodic app-server query. This applies both to codex.exe and cmd.exe
+    // when an npm/bun .cmd shim has to be used.
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(windows)]
 fn windows_codex_command(requested: &str) -> Result<Command, String> {
     let resolved = resolve_windows_codex(requested);
     let lower = resolved.to_string_lossy().to_ascii_lowercase();
@@ -170,12 +183,14 @@ fn windows_codex_command(requested: &str) -> Result<Command, String> {
         );
         let mut c = Command::new("cmd.exe");
         c.args(["/D", "/S", "/C"]).arg(invocation);
+        hide_console_window(&mut c);
         return Ok(c);
     }
 
     if resolved.is_file() || lower.ends_with(".exe") {
         let mut c = Command::new(&resolved);
         c.args(["app-server", "--stdio"]);
+        hide_console_window(&mut c);
         return Ok(c);
     }
 
@@ -190,6 +205,7 @@ fn windows_codex_command(requested: &str) -> Result<Command, String> {
     };
     let mut c = Command::new("cmd.exe");
     c.args(["/D", "/C"]).arg(invocation);
+    hide_console_window(&mut c);
     Ok(c)
 }
 
@@ -229,8 +245,15 @@ fn resolve_windows_codex(requested: &str) -> PathBuf {
             .or_else(|| env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".codex")));
         if let Some(home) = codex_home {
             for relative in [
-                Path::new("packages").join("standalone").join("current").join("bin").join("codex.exe"),
-                Path::new("packages").join("standalone").join("current").join("codex.exe"),
+                Path::new("packages")
+                    .join("standalone")
+                    .join("current")
+                    .join("bin")
+                    .join("codex.exe"),
+                Path::new("packages")
+                    .join("standalone")
+                    .join("current")
+                    .join("codex.exe"),
             ] {
                 let path = home.join(relative);
                 if path.is_file() {
@@ -308,7 +331,9 @@ fn wait_for_id(
     loop {
         let now = Instant::now();
         if now >= deadline {
-            return Err(format!("codex app-server timed out waiting for response id {wanted_id}"));
+            return Err(format!(
+                "codex app-server timed out waiting for response id {wanted_id}"
+            ));
         }
         let remaining = deadline.saturating_duration_since(now);
         let line = match rx.recv_timeout(remaining) {
@@ -381,8 +406,14 @@ fn snapshot_from_result(result: &Value) -> Result<Snapshot, String> {
         primary: parse_window(rate.get("primary")),
         secondary: parse_window(rate.get("secondary")),
         credits: parse_credits(rate.get("credits")),
-        plan_type: rate.get("planType").and_then(Value::as_str).map(str::to_owned),
-        limit_id: rate.get("limitId").and_then(Value::as_str).map(str::to_owned),
+        plan_type: rate
+            .get("planType")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        limit_id: rate
+            .get("limitId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         reset_credits_available,
     })
 }
@@ -392,22 +423,40 @@ fn parse_window(value: Option<&Value>) -> Option<WindowUsage> {
     let utilization = value
         .get("usedPercent")
         .and_then(Value::as_f64)
-        .or_else(|| value.get("usedPercent").and_then(Value::as_i64).map(|n| n as f64))?
+        .or_else(|| {
+            value
+                .get("usedPercent")
+                .and_then(Value::as_i64)
+                .map(|n| n as f64)
+        })?
         .clamp(0.0, 100.0);
     let duration_minutes = value.get("windowDurationMins").and_then(Value::as_u64);
     let resets_at = value
         .get("resetsAt")
         .and_then(Value::as_i64)
         .and_then(|ts| Utc.timestamp_opt(ts, 0).single());
-    Some(WindowUsage { utilization, duration_minutes, resets_at })
+    Some(WindowUsage {
+        utilization,
+        duration_minutes,
+        resets_at,
+    })
 }
 
 fn parse_credits(value: Option<&Value>) -> Option<Credits> {
     let value = value?.as_object()?;
     Some(Credits {
-        has_credits: value.get("hasCredits").and_then(Value::as_bool).unwrap_or(false),
-        unlimited: value.get("unlimited").and_then(Value::as_bool).unwrap_or(false),
-        balance: value.get("balance").and_then(Value::as_str).map(str::to_owned),
+        has_credits: value
+            .get("hasCredits")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        unlimited: value
+            .get("unlimited")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        balance: value
+            .get("balance")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     })
 }
 
